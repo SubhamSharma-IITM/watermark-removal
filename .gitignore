@@ -7,3 +7,4 @@ output/
 *.egg-info/
 dist/
 build/
+output_v2/
