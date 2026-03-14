@@ -54,6 +54,11 @@ class ImageAnalysis:
     cool_fraction: float  # fraction of bright pixels with mild cool cast (b < 124)
     grey_mass: float  # histogram mass in mid-luminance range [80, 200]
     mean_b_shift: float  # mean b* shift of bright pixels (positive = more blue)
+    coarse_blue_fraction: (
+        float  # downsampled bright-pixel blue ratio (faint large structures)
+    )
+    coarse_mean_b_shift: float  # downsampled mean b* shift (positive = bluer)
+    has_blue_lab_faint: bool  # weak LAB signal only visible at coarse spatial scale
 
 
 def analyze_image(img_bgr: np.ndarray) -> ImageAnalysis:
@@ -135,6 +140,31 @@ def analyze_image(img_bgr: np.ndarray) -> ImageAnalysis:
     # Mild cool cast fallback (for very light blue-tinted watermark backgrounds)
     has_cool_cast = cool_fraction > 0.30 and mean_b_shift > 1.0
 
+    # ── Coarse-scale faint-blue detection (for large, very light structures) ──
+    coarse_h = max(1, w // 4)
+    coarse_v = max(1, h // 4)
+    coarse_bgr = cv2.resize(img_bgr, (coarse_h, coarse_v), interpolation=cv2.INTER_AREA)
+    coarse_lab = cv2.cvtColor(coarse_bgr, cv2.COLOR_BGR2Lab)
+    coarse_L = coarse_lab[:, :, 0].astype(np.float32)
+    coarse_b = coarse_lab[:, :, 2].astype(np.float32)
+    coarse_bright = coarse_L > 90.0
+
+    coarse_count = int(np.count_nonzero(coarse_bright))
+    if coarse_count > 0:
+        coarse_shift = 128.0 - coarse_b[coarse_bright]
+        coarse_blue_fraction = float(np.mean(coarse_shift > 6.0))
+        coarse_mean_b_shift = float(np.mean(coarse_shift))
+    else:
+        coarse_blue_fraction = 0.0
+        coarse_mean_b_shift = 0.0
+
+    has_blue_lab_faint = (
+        coarse_blue_fraction > 0.18
+        and coarse_mean_b_shift > 4.2
+        and mean_b_shift > 1.0
+        and not has_blue_saturated
+    )
+
     has_blue = has_blue_lab or has_blue_saturated
 
     # ── Grey detection (luminance histogram) ──────────────────────────────
@@ -174,13 +204,18 @@ def analyze_image(img_bgr: np.ndarray) -> ImageAnalysis:
         cool_fraction=cool_fraction,
         grey_mass=grey_mass,
         mean_b_shift=mean_b_shift,
+        coarse_blue_fraction=coarse_blue_fraction,
+        coarse_mean_b_shift=coarse_mean_b_shift,
+        has_blue_lab_faint=has_blue_lab_faint,
     )
 
 
 # ── Red watermark removal ─────────────────────────────────────────────────────
 
 
-def _remove_red_pixels(img_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _remove_red_pixels(
+    img_bgr: np.ndarray, force_white: bool = True
+) -> Tuple[np.ndarray, np.ndarray]:
     """Remove red/maroon watermark pixels via HSV color masking.
 
     Returns (cleaned_bgr, dilated_mask).  The dilated mask is kept and applied
@@ -199,8 +234,29 @@ def _remove_red_pixels(img_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     dilated_mask = cv2.dilate(red_mask, dilate_kernel, iterations=3)
 
     result = img_bgr.copy()
-    result[dilated_mask > 0] = [255, 255, 255]
+    if force_white:
+        result[dilated_mask > 0] = [255, 255, 255]
     return result, dilated_mask
+
+
+def _inpaint_masked_regions(
+    img_bgr: np.ndarray,
+    mask: np.ndarray,
+    inpaint_radius: float = 3.0,
+) -> np.ndarray:
+    """Fill masked watermark regions with content-aware inpainting.
+
+    Uses OpenCV Telea (fast marching) to reconstruct local structures and
+    preserve line continuity under removed colored text.
+    """
+    if mask is None or mask.size == 0:
+        return img_bgr
+
+    mask_u8 = np.where(mask > 0, 255, 0).astype(np.uint8)
+    if int(np.count_nonzero(mask_u8)) == 0:
+        return img_bgr
+
+    return cv2.inpaint(img_bgr, mask_u8, inpaint_radius, cv2.INPAINT_TELEA)
 
 
 # ── Saturated blue watermark removal — HSV masking ──────────────────────────
@@ -293,6 +349,104 @@ def _remove_blue_watermark_lab(img_bgr: np.ndarray) -> np.ndarray:
     corrected_L = np.clip(corrected_L, 0.0, 255.0)
 
     return corrected_L.astype(np.uint8)
+
+
+def _blue_confidence_map_from_bgr(img_bgr: np.ndarray) -> np.ndarray:
+    """Compute a LAB blue-shift confidence map in [0, 1] for a BGR image."""
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2Lab)
+    L_f = lab[:, :, 0].astype(np.float32)
+    b_f = lab[:, :, 2].astype(np.float32)
+
+    b_shift = 128.0 - b_f
+    blue_excess = np.maximum(0.0, b_shift - 8.0)
+    lightness_weight = np.clip((L_f - 60.0) / 80.0, 0.0, 1.0)
+    confidence = np.clip(blue_excess / 35.0, 0.0, 1.0) * lightness_weight
+    return confidence.astype(np.float32)
+
+
+def _remove_blue_watermark_lab_multiscale(
+    img_bgr: np.ndarray,
+    scales: Tuple[float, ...] = (1.0, 0.5, 0.25),
+    weights: Tuple[float, ...] = (0.62, 0.26, 0.12),
+    amplifier: float = 1.25,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Remove faint blue watermark structures via multi-scale LAB confidence fusion.
+
+    A confidence map is computed at multiple spatial scales, upsampled to full
+    resolution, and fused. This captures large low-saturation blue overlays
+    that may be too weak at full-resolution local statistics.
+
+    Returns (corrected_gray, fused_confidence).
+    """
+    if len(scales) != len(weights):
+        raise ValueError("scales and weights must have equal length")
+
+    h, w = img_bgr.shape[:2]
+    fused = np.zeros((h, w), dtype=np.float32)
+    weight_sum = 0.0
+
+    for scale, weight in zip(scales, weights):
+        if scale <= 0.0 or weight <= 0.0:
+            continue
+
+        if abs(scale - 1.0) < 1e-6:
+            scaled = img_bgr
+        else:
+            sw = max(1, int(round(w * scale)))
+            sh = max(1, int(round(h * scale)))
+            scaled = cv2.resize(img_bgr, (sw, sh), interpolation=cv2.INTER_AREA)
+
+        conf = _blue_confidence_map_from_bgr(scaled)
+        if conf.shape[:2] != (h, w):
+            conf = cv2.resize(conf, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        fused += conf * float(weight)
+        weight_sum += float(weight)
+
+    if weight_sum > 0.0:
+        fused /= weight_sum
+
+    # Suppress high-frequency noise while keeping broad faint patterns.
+    fused = cv2.GaussianBlur(fused, (0, 0), sigmaX=0.9)
+
+    lab_full = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2Lab)
+    L_f = lab_full[:, :, 0].astype(np.float32)
+    corrected_L = L_f + fused * (255.0 - L_f) * amplifier
+    corrected_L = np.clip(corrected_L, 0.0, 255.0)
+
+    return corrected_L.astype(np.uint8), fused
+
+
+def _pre_luminance_lift(gray: np.ndarray, white_point: int = 240) -> np.ndarray:
+    """Lift near-white luminance toward pure white before CLAHE.
+
+    Designed to whiten subtle scanner background textures before local contrast
+    enhancement, preventing CLAHE from boosting faint watermark residue.
+    """
+    white_point = int(np.clip(white_point, 220, 250))
+    knee = max(175, white_point - 45)
+    soft_start = max(140, knee - 40)
+
+    lut = np.arange(256, dtype=np.float32)
+
+    for i in range(256):
+        fi = float(i)
+        if fi >= white_point:
+            lut[i] = 255.0
+            continue
+
+        if fi >= knee:
+            t = (fi - knee) / max(1.0, (white_point - knee))
+            t_smooth = t * t * (3.0 - 2.0 * t)
+            lut[i] = fi + (255.0 - fi) * (0.25 + 0.75 * t_smooth)
+            continue
+
+        if fi >= soft_start:
+            t = (fi - soft_start) / max(1.0, (knee - soft_start))
+            lut[i] = fi + 8.0 * t
+
+    lut = np.clip(lut, 0.0, 255.0).astype(np.uint8)
+    return cv2.LUT(gray, lut)
 
 
 # ── Grey watermark removal — Otsu-blended adaptive LUT ───────────────────────
@@ -429,7 +583,11 @@ def _remove_tiny_light_residue(gray: np.ndarray) -> np.ndarray:
     return out
 
 
-def _enhance_output(gray: np.ndarray, is_clean: bool = False) -> np.ndarray:
+def _enhance_output(
+    gray: np.ndarray,
+    is_clean: bool = False,
+    pre_luma_white_point: Optional[int] = None,
+) -> np.ndarray:
     """Post-processing enhancement pipeline.
 
     For watermarked images (is_clean=False)
@@ -475,6 +633,9 @@ def _enhance_output(gray: np.ndarray, is_clean: bool = False) -> np.ndarray:
         clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
         return clahe.apply(gray)
 
+    if pre_luma_white_point is not None and pre_luma_white_point > 0:
+        gray = _pre_luminance_lift(gray, white_point=pre_luma_white_point)
+
     # Step 1: CLAHE local contrast normalization
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
@@ -503,6 +664,9 @@ def _enhance_output(gray: np.ndarray, is_clean: bool = False) -> np.ndarray:
 def remove_watermark_v2(
     img_path: str,
     verbose: bool = False,
+    enable_multiscale_blue: bool = False,
+    enable_red_inpaint: bool = False,
+    pre_luma_lift: int = 0,
 ) -> Optional[bytes]:
     """Remove watermark from a scanned question paper image.
 
@@ -532,11 +696,15 @@ def remove_watermark_v2(
     # ── Step 1: Classify ─────────────────────────────────────────────────
     analysis = analyze_image(img_bgr)
 
+    use_faint_blue_route = enable_multiscale_blue and analysis.has_blue_lab_faint
+
     if verbose:
         print(
             f"    type={analysis.wm_type:8s} "
             f"blue_frac={analysis.blue_fraction:.3f} "
             f"b_shift={analysis.mean_b_shift:+.1f} "
+            f"coarse_blue={analysis.coarse_blue_fraction:.3f} "
+            f"coarse_shift={analysis.coarse_mean_b_shift:+.1f} "
             f"blue_hsv={analysis.blue_hsv_ratio:.3f} "
             f"cool_frac={analysis.cool_fraction:.3f} "
             f"grey_mass={analysis.grey_mass:.3f} "
@@ -544,7 +712,7 @@ def remove_watermark_v2(
         )
 
     # ── Step 2: Clean passthrough ─────────────────────────────────────────
-    if analysis.wm_type == "none":
+    if analysis.wm_type == "none" and not use_faint_blue_route:
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         enhanced = _enhance_output(gray, is_clean=True)
         success, buffer = cv2.imencode(".png", enhanced)
@@ -554,9 +722,17 @@ def remove_watermark_v2(
     red_mask = None
     blue_mask = None
     working_img = img_bgr
+    red_was_inpainted = False
 
     if analysis.has_red:
-        working_img, red_mask = _remove_red_pixels(working_img)
+        working_img, red_mask = _remove_red_pixels(
+            working_img, force_white=not enable_red_inpaint
+        )
+        if enable_red_inpaint:
+            working_img = _inpaint_masked_regions(
+                working_img, red_mask, inpaint_radius=3.2
+            )
+            red_was_inpainted = True
 
     if analysis.has_blue_saturated and not analysis.has_blue_lab:
         # Opaque/saturated blue logo: erase via HSV masking BEFORE grayscale.
@@ -565,9 +741,15 @@ def remove_watermark_v2(
         working_img, blue_mask = _remove_blue_pixels(working_img)
 
     # ── Step 4: Watermark removal for remaining chromatic cast ─────────────
-    if analysis.has_blue_lab:
+    blue_confidence_map = None
+    if analysis.has_blue_lab or use_faint_blue_route:
         # Semi-transparent light-blue tint: LAB b* confidence map
-        gray = _remove_blue_watermark_lab(working_img)
+        if enable_multiscale_blue:
+            gray, blue_confidence_map = _remove_blue_watermark_lab_multiscale(
+                working_img
+            )
+        else:
+            gray = _remove_blue_watermark_lab(working_img)
     elif analysis.has_grey:
         # Grey watermark cast: adaptive Otsu LUT
         gray = _remove_grey_watermark_adaptive(working_img)
@@ -577,15 +759,52 @@ def remove_watermark_v2(
         gray = cv2.cvtColor(working_img, cv2.COLOR_BGR2GRAY)
 
     # ── Step 5: Enhancement pipeline ──────────────────────────────────────
-    enhanced = _enhance_output(gray, is_clean=False)
+    enhanced = _enhance_output(
+        gray,
+        is_clean=False,
+        pre_luma_white_point=pre_luma_lift if pre_luma_lift > 0 else None,
+    )
 
     # ── Step 6: Re-apply colour masks ─────────────────────────────────────
     # Sharpening can create dark halo rings around formerly-coloured regions.
     # Force them back to white to prevent ghost outlines.
-    if red_mask is not None and red_mask.shape == enhanced.shape:
+    if (
+        red_mask is not None
+        and red_mask.shape == enhanced.shape
+        and not red_was_inpainted
+    ):
         enhanced[red_mask > 0] = 255
     if blue_mask is not None and blue_mask.shape == enhanced.shape:
         enhanced[blue_mask > 0] = 255
+
+    if verbose:
+        active_multiscale = enable_multiscale_blue and (
+            analysis.has_blue_lab or use_faint_blue_route
+        )
+        blue_conf_mean = (
+            float(np.mean(blue_confidence_map))
+            if blue_confidence_map is not None
+            else 0.0
+        )
+        blue_conf_p95 = (
+            float(np.percentile(blue_confidence_map, 95))
+            if blue_confidence_map is not None
+            else 0.0
+        )
+        red_cov = (
+            float(np.count_nonzero(red_mask)) / float(red_mask.size)
+            if red_mask is not None and red_mask.size > 0
+            else 0.0
+        )
+        high_luma = float(np.mean(enhanced >= 245))
+        print(
+            f"    mode: multiscale_blue={active_multiscale} "
+            f"red_inpaint={red_was_inpainted} pre_luma_lift={pre_luma_lift if pre_luma_lift > 0 else 0}"
+        )
+        print(
+            f"    metrics: blue_conf_mean={blue_conf_mean:.3f} "
+            f"blue_conf_p95={blue_conf_p95:.3f} red_cov={red_cov:.4f} high_luma={high_luma:.3f}"
+        )
 
     success, buffer = cv2.imencode(".png", enhanced)
     return buffer.tobytes() if success else None
@@ -598,6 +817,9 @@ def process_directory(
     input_dir: str,
     output_dir: str,
     verbose: bool = False,
+    enable_multiscale_blue: bool = False,
+    enable_red_inpaint: bool = False,
+    pre_luma_lift: int = 0,
 ) -> None:
     """Process all images in input_dir, write cleaned PNGs to output_dir."""
     input_path = Path(input_dir)
@@ -612,6 +834,12 @@ def process_directory(
         return
 
     print(f"Processing {len(images)} images  ->  {output_path}")
+    print(
+        "  V2+ mode: "
+        f"multiscale_blue={enable_multiscale_blue}, "
+        f"red_inpaint={enable_red_inpaint}, "
+        f"pre_luma_lift={pre_luma_lift if pre_luma_lift > 0 else 0}"
+    )
     if verbose:
         print(f"  {'#':>5}  {'filename':<25}  classification + stats")
         print(f"  {'-'*5}  {'-'*25}  {'-'*50}")
@@ -629,7 +857,13 @@ def process_directory(
         wm_type = analyze_image(img).wm_type if img is not None else "failed"
         type_counts[wm_type] = type_counts.get(wm_type, 0) + 1
 
-        cleaned_bytes = remove_watermark_v2(str(img_path), verbose=verbose)
+        cleaned_bytes = remove_watermark_v2(
+            str(img_path),
+            verbose=verbose,
+            enable_multiscale_blue=enable_multiscale_blue,
+            enable_red_inpaint=enable_red_inpaint,
+            pre_luma_lift=pre_luma_lift,
+        )
         out_file = output_path / img_path.with_suffix(".png").name
 
         if cleaned_bytes:
@@ -687,6 +921,29 @@ Examples:
         action="store_true",
         help="Print per-image classification details.",
     )
+    parser.add_argument(
+        "--enable-multiscale-blue",
+        action="store_true",
+        help="Enable multi-scale LAB confidence fusion for faint large blue watermarks.",
+    )
+    parser.add_argument(
+        "--enable-red-inpaint",
+        action="store_true",
+        help="Use Telea inpainting for red watermark regions instead of white fill.",
+    )
+    parser.add_argument(
+        "--pre-luma-lift",
+        type=int,
+        default=0,
+        help="Near-white luminance lift threshold before CLAHE (220-250, 0=off).",
+    )
 
     args = parser.parse_args()
-    process_directory(args.input_dir, args.output_dir, verbose=args.verbose)
+    process_directory(
+        args.input_dir,
+        args.output_dir,
+        verbose=args.verbose,
+        enable_multiscale_blue=args.enable_multiscale_blue,
+        enable_red_inpaint=args.enable_red_inpaint,
+        pre_luma_lift=args.pre_luma_lift,
+    )
