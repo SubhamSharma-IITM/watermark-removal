@@ -1,9 +1,33 @@
-__pycache__/
+# Python cache
+
+**pycache**/
 *.py[cod]
+
+# Virtual environments
+
+.venv/
+venv/
+
+# Environment files
+
 .env
+
+# IDE files
+
 .vscode/
 .idea/
+
+# Output files (IMPORTANT - don't push results unless required)
+
 output/
+
+# Build / packaging
+
 *.egg-info/
 dist/
 build/
+
+# OS files
+
+.DS_Store
+Thumbs.db
